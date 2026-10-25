@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "Claude Code Browser Bridge",
+  "version": "3.4.0",
+  "description": "Bridge between Claude Code and Chrome browser - full browser automation",
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "scripting",
+    "tabGroups",
+    "storage",
+    "alarms",
+    "debugger",
+    "webNavigation",
+    "downloads",
+    "clipboardWrite",
+    "cookies",
+    "browsingData"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": [
+        "content-scripts/accessibility-tree.js",
+        "content-scripts/visual-indicator.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Claude Code Browser Bridge"
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}

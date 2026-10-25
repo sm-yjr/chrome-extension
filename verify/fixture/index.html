@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Bridge fixture</title>
+  <style>
+    body { font: 16px/1.4 sans-serif; margin: 24px; }
+    button, input { font: 16px sans-serif; padding: 8px 12px; }
+    #fetch-out, #geo-out { white-space: pre-wrap; border: 1px solid #ccc; min-height: 1.4em; padding: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Bridge fixture</h1>
+  <p id="find-me">Visible fixture string alpha-bridge-77 for find_text.</p>
+  <p id="passage">Selectable paragraph for page selection. The chosen sentence is gamma-select-42.</p>
+
+  <div id="shadow-host"></div>
+  <p>Counter <span id="counter">0</span></p>
+
+  <form id="name-form" action="javascript:void(0)">
+    <label for="field">Name</label>
+    <input id="field" name="field" type="text" autocomplete="off" />
+  </form>
+
+  <p>
+    <button id="fetch-btn" type="button">Fetch echo</button>
+  </p>
+  <pre id="fetch-out" data-gen="0"></pre>
+
+  <p>
+    <button id="geo-btn" type="button">Read location</button>
+  </p>
+  <pre id="geo-out"></pre>
+
+  <script>
+    const host = document.getElementById("shadow-host");
+    const root = host.attachShadow({ mode: "open" });
+    const style = document.createElement("style");
+    style.textContent = "button { font: 16px sans-serif; padding: 8px 12px; }";
+    const inc = document.createElement("button");
+    inc.type = "button";
+    inc.id = "shadow-inc";
+    inc.textContent = "Increment shadow";
+    inc.addEventListener("click", () => {
+      const el = document.getElementById("counter");
+      el.textContent = String(Number(el.textContent) + 1);
+    });
+    root.append(style, inc);
+
+    document.getElementById("fetch-btn").addEventListener("click", async () => {
+      const out = document.getElementById("fetch-out");
+      const gen = Number(out.dataset.gen || "0") + 1;
+      out.dataset.gen = String(gen);
+      out.dataset.state = "loading";
+      try {
+        const res = await fetch("/echo?n=" + gen, { cache: "no-store" });
+        out.textContent = await res.text();
+        out.dataset.state = "done";
+      } catch (err) {
+        out.textContent = String(err && err.message ? err.message : err);
+        out.dataset.state = "error";
+      }
+    });
+
+    document.getElementById("geo-btn").addEventListener("click", () => {
+      const out = document.getElementById("geo-out");
+      out.dataset.state = "loading";
+      if (!navigator.geolocation) {
+        out.dataset.state = "error";
+        out.textContent = JSON.stringify({ error: "geolocation missing" });
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          out.dataset.state = "ok";
+          out.textContent = JSON.stringify({
+            lat: pos.coords.latitude,
+            lng: pos.coords.longitude,
+            acc: pos.coords.accuracy,
+          });
+        },
+        (err) => {
+          out.dataset.state = "error";
+          out.textContent = JSON.stringify({
+            code: err.code,
+            message: err.message,
+          });
+        },
+        { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
+      );
+    });
+  </script>
+</body>
+</html>

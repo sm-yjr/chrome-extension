@@ -1,0 +1,20 @@
+{
+  "name": "claude-chrome-bridge",
+  "version": "3.4.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "check": "tsc --noEmit",
+    "test:security": "node --test test/security.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "ws": "^8.21.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.0"
+  },
+  "private": true
+}

@@ -1,0 +1,6 @@
+{
+  "name": "claude-chrome-bridge-extension",
+  "private": true,
+  "type": "module",
+  "description": "Marks extension/*.js as ES modules for node tooling (e.g. node --check). Not parsed by Chrome."
+}

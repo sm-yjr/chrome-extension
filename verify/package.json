@@ -1,0 +1,13 @@
+{
+  "name": "claude-chrome-bridge-verify",
+  "private": true,
+  "type": "module",
+  "description": "Acceptance tests for the Chrome extension bridge. Own package so it does not share dependency edits with the extension or MCP server.",
+  "scripts": {
+    "test": "node src/run.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.20.0",
+    "playwright": "^1.56.0"
+  }
+}
