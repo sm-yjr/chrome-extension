@@ -126,6 +126,7 @@ function isForeignExtensionDenied(err) {
   return String(err?.message || err).includes("Cannot access a chrome-extension:// URL of different extension");
 }
 async function syntheticInputFallback(method, params) {
+  if (method === "typeTextSynthetic" && params.nativeFallback) return { nativeInputRequired: true };
   const result = await handlers[method](params);
   return { ...result, inputMode: "synthetic", fallbackReason: "Chrome blocked CDP input due to another extension frame; used permitted page DOM APIs. Trusted-event checks may reject this input." };
 }
@@ -2354,7 +2355,88 @@ function webauthnState(session) {
 
 // --- Command handlers ---
 
+const nativeInputTickets = new Map();
+
 const handlers = {
+  async prepareNativeInput(params) {
+    const tabId = params.tabId || await getActiveTabId();
+    const tab = await chrome.tabs.get(tabId);
+    if (!/^https?:\/\//.test(tab.url || "")) throw new Error("NATIVE_INPUT_UNSUPPORTED_PAGE");
+    const routed = routeRef(tabId, params.ref);
+    const frameId = routed ? routed.frameId : params.frameId || 0;
+    await ensureContentScripts(tabId);
+    await chrome.tabs.update(tabId, { active: true });
+    await chrome.windows.update(tab.windowId, { focused: true });
+    const ticket = crypto.randomUUID();
+    const results = await chrome.scripting.executeScript({
+      target: frameTarget(tabId, frameId),
+      func: (ticket, ref, selector) => {
+        const el = ref ? globalThis.__claudeA11yTree?.getElementByRef(ref) : selector ? document.querySelector(selector) : document.activeElement;
+        if (!el || el.disabled || el.readOnly || !(el.matches("input,textarea") || el.isContentEditable)) return {error: "NATIVE_INPUT_NOT_EDITABLE"};
+        if (el.matches("input") && ["checkbox", "radio", "file", "button", "submit", "reset", "range", "color", "hidden"].includes(el.type)) return {error: "NATIVE_INPUT_NOT_EDITABLE"};
+        el.scrollIntoView({block:"center",inline:"center"});
+        el.focus({preventScroll:true});
+        globalThis.__ccbNativeInputs ||= new Map();
+        globalThis.__ccbNativeInputs.set(ticket, {el, url:location.href});
+        return {elementId:el.id || ""};
+      },
+      args: [ticket, routed?.localRef || null, params.selector || null],
+    });
+    const info = results[0]?.result;
+    if (!info || info.error) throw new Error(info?.error || "NATIVE_INPUT_PREPARE_FAILED");
+    nativeInputTickets.set(ticket, {tabId, frameId, windowId:tab.windowId, url:tab.url, elementId:info.elementId, expires:Date.now()+60000});
+    return {ticket, tabId, expectedURL:tab.url, expectedDOMId:info.elementId};
+  },
+
+  async checkNativeInput(params) {
+    const target = nativeInputTickets.get(params.ticket);
+    if (!target || target.expires < Date.now()) throw new Error("NATIVE_INPUT_TICKET_EXPIRED");
+    const tab = await chrome.tabs.get(target.tabId);
+    const win = await chrome.windows.get(target.windowId);
+    if (!tab.active || !win.focused || tab.url !== target.url) throw new Error("NATIVE_INPUT_TARGET_CHANGED");
+    const results = await chrome.scripting.executeScript({
+      target: frameTarget(target.tabId, target.frameId),
+      func: ticket => {
+        const state = globalThis.__ccbNativeInputs?.get(ticket);
+        if (!state || state.url !== location.href || !state.el.isConnected || !document.hasFocus()) return false;
+        let active = document.activeElement;
+        while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+        return active === state.el && !state.el.disabled && !state.el.readOnly;
+      }, args:[params.ticket],
+    });
+    if (!results[0]?.result) throw new Error("NATIVE_INPUT_FOCUS_CHANGED");
+    return {ok:true};
+  },
+
+  async finishNativeInput(params) {
+    await handlers.checkNativeInput(params);
+    const target = nativeInputTickets.get(params.ticket);
+    const results = await chrome.scripting.executeScript({
+      target: frameTarget(target.tabId, target.frameId),
+      func: ticket => {
+        const state = globalThis.__ccbNativeInputs?.get(ticket);
+        if (!state) return {error:"NATIVE_INPUT_TICKET_EXPIRED"};
+        globalThis.__ccbNativeInputs.delete(ticket);
+        const el = state.el;
+        const sensitive = el.type === "password" || /password|one-time-code|cc-number|cc-csc/.test(el.autocomplete || "");
+        return {tagName:el.tagName.toLowerCase(),value:sensitive ? "[redacted]" : String(el.value ?? el.textContent ?? "").slice(0,1000)};
+      }, args:[params.ticket],
+    });
+    nativeInputTickets.delete(params.ticket);
+    const result=results[0]?.result;
+    if (!result || result.error) throw new Error(result?.error || "NATIVE_INPUT_READBACK_FAILED");
+    return {...result, inputMode:"native", backend:"macOS-CGEventPostToPid", tabId:target.tabId};
+  },
+
+  async cancelNativeInput(params) {
+    const target = nativeInputTickets.get(params.ticket);
+    nativeInputTickets.delete(params.ticket);
+    if (target) {
+      try { await chrome.scripting.executeScript({target:frameTarget(target.tabId,target.frameId),func:ticket=>{globalThis.__ccbNativeInputs?.delete(ticket);},args:[params.ticket]}); } catch {}
+    }
+    return {ok:true};
+  },
+
 
   // === Tab management ===
 
@@ -3160,7 +3242,7 @@ const handlers = {
     try {
       await ensureCdp(tabId);
     } catch (e) {
-      if (isCdpUnavailable(e)) return handlers.typeTextSynthetic(params);
+      if (isCdpUnavailable(e)) return params.nativeFallback ? { nativeInputRequired: true } : handlers.typeTextSynthetic(params);
       throw e;
     }
 

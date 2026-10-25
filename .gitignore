@@ -17,3 +17,5 @@ artifacts/
 *.mhtml
 *.pdf
 *profile*/
+
+server/native/.build/

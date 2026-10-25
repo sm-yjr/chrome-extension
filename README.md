@@ -69,3 +69,15 @@ Tests create a random token and disposable browser profile. They do not use your
 ### Password-manager extension compatibility
 
 Some Chrome builds block debugger input or screenshots when another extension inserts its own frame (observed with iCloud Passwords). Before any text has been entered, the bridge can fall back to ordinary page DOM input and labels the result `inputMode: synthetic`. It does not access the other extension or change its settings. Sites requiring trusted input events may still reject this fallback. Partially typed input is never automatically replayed. Screenshot fallback captures the visible viewport through Chrome's normal capture API; full-page capture is unavailable in this case.
+
+### Keep iCloud's in-page list and use trusted OS keyboard input (macOS)
+
+Chrome can deny its debugger when a password manager embeds its own extension frame. The optional macOS helper keeps that frame and the password manager enabled while sending operating-system keyboard events directly to Google Chrome's process. Successful input reports `inputMode: native` and `backend: macOS-CGEventPostToPid`; it is separate from CDP input and DOM synthesis.
+
+1. Run `./script/build_and_run.sh --verify` from the repository root. Xcode Command Line Tools are required. The helper is built locally; no prebuilt helper is downloaded.
+2. Set `BRIDGE_NATIVE_INPUT` to `1` in the local environment configuration for this MCP server, alongside the existing pairing token. Restart the MCP client and reload the unpacked extension. Do not publish the local configuration or token.
+3. macOS must authorize Accessibility/event posting for the process running the helper. The status check reports availability without requesting permission or changing system settings. Missing authorization produces an explicit error; it does not silently use DOM synthesis.
+
+The native path is used only if initial CDP input cannot run. It activates the requested tab/window, focuses the requested editable element, checks the same tab, document and focused element between batches, and checks the foreground application, document URL, editable AX role, page-content ancestry and focused AX element before each key pair. Input is serialized, limited to 4096 UTF-16 units per request, and passed to the fixed helper over stdin in batches of at most 16 characters. It never uses the clipboard, global keyboard posting, or the password manager's contents or settings. A focus change or partial failure stops input without retrying it. Like other foreground automation, it should not be used while you are interacting with that Chrome window. Browser shortcuts and contentEditable/embedded-frame accessibility support can vary across Chrome versions; unsupported focus states fail closed.
+
+For a real acceptance test, inspect the page's `keydown`/`input` event `isTrusted` counters and confirm the password manager's frame remains present. Text appearing in a field alone is insufficient evidence. Screenshots may still use `captureVisibleTab` while the password-manager frame is present.

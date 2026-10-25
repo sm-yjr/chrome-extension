@@ -1,5 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { randomBytes, createHmac, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -228,6 +230,61 @@ function writeArtifact(art: {
   return { path: outPath, bytes: body.length };
 }
 
+// Native input is opt-in and uses a fixed local helper, never commands supplied
+// by the extension or page. Text is passed over stdin, not command-line args.
+let nativeInputTail: Promise<unknown> = Promise.resolve();
+function runNativeBatch(request: Record<string, unknown>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const binary = fileURLToPath(new URL("../native/.build/browser-native-input", import.meta.url));
+    const child = spawn(binary, [], {stdio:["pipe","pipe","pipe"],env:{PATH:"/usr/bin:/bin"}});
+    let output="";
+    const timer=setTimeout(()=>child.kill(),10000);
+    child.stdout.on("data", chunk => { output += chunk.toString(); if(output.length>8192) child.kill(); });
+    child.stderr.on("data",()=>{});
+    child.on("error", error=>{clearTimeout(timer);reject(new Error(`NATIVE_INPUT_HELPER_FAILED: ${error.message}. Build script/build_and_run.sh first.`));});
+    child.on("close",code=>{
+      clearTimeout(timer);
+      let result;
+      try { result=JSON.parse(output); } catch { reject(new Error("NATIVE_INPUT_HELPER_FAILED: no valid acknowledgement; input will not be retried"));return; }
+      if(code!==0 || !result.ok) {reject(new Error(result.error || "NATIVE_INPUT_FAILED: input will not be retried"));return;}
+      resolve();
+    });
+    child.stdin.on("error",()=>{});
+    child.stdin.end(JSON.stringify(request)+"\n");
+  });
+}
+async function nativeTypeText(params: any): Promise<any> {
+  const text=String(params.text ?? "");
+  if(text.length>4096) throw new Error("NATIVE_INPUT_TOO_LARGE: maximum 4096 UTF-16 units");
+  const prepared=await sendToExtension("prepareNativeInput",params);
+  const target={expectedURL:prepared.expectedURL,expectedDOMId:prepared.expectedDOMId};
+  const checkedBatch=async(action: string,value?: string)=>{
+    await sendToExtension("checkNativeInput",{ticket:prepared.ticket});
+    await runNativeBatch({...target,action,...(value!==undefined?{text:value}:{})});
+  };
+  try {
+    if(params.clearFirst) await checkedBatch("clear");
+    const characters=Array.from(text);
+    for(let index=0;index<characters.length;index+=16) await checkedBatch("text",characters.slice(index,index+16).join(""));
+    const result=await sendToExtension("finishNativeInput",{ticket:prepared.ticket});
+    // Submitting can navigate immediately, so validate focus before sending Enter
+    // and retain the pre-submit readback rather than retrying after navigation.
+    if(params.submit) {
+      const next=await sendToExtension("prepareNativeInput",params);
+      try {
+        await sendToExtension("checkNativeInput",{ticket:next.ticket});
+        await runNativeBatch({expectedURL:next.expectedURL,expectedDOMId:next.expectedDOMId,action:"enter"});
+      } finally {await sendToExtension("cancelNativeInput",{ticket:next.ticket});}
+    }
+    return result;
+  } finally {await sendToExtension("cancelNativeInput",{ticket:prepared.ticket}).catch(()=>{});}
+}
+function serializedNativeTypeText(params: any): Promise<any> {
+  const job=nativeInputTail.catch(()=>{}).then(()=>nativeTypeText(params));
+  nativeInputTail=job;
+  return job;
+}
+
 function toolHandler(method: string) {
   return async (params: any) => {
     try {
@@ -266,7 +323,9 @@ function toolHandler(method: string) {
           : longRunning
             ? 120000
             : REQUEST_TIMEOUT;
-      const result = await sendToExtension(method, forwarded, waitTimeout);
+      const nativeEnabled = method === "typeText" && process.platform === "darwin" && process.env.BRIDGE_NATIVE_INPUT === "1";
+      let result = await sendToExtension(method, nativeEnabled ? {...forwarded,nativeFallback:true} : forwarded, waitTimeout);
+      if (nativeEnabled && result?.nativeInputRequired) result = await serializedNativeTypeText(forwarded);
       if (result.image) {
         const mimeType = `image/${result.format || "png"}`;
         return {
@@ -629,7 +688,7 @@ server.tool(
 
 server.tool(
   "type_text",
-  "Type text into an input, textarea, or contentEditable element. Dispatches TRUSTED keystrokes via the Chrome DevTools Protocol (real keyDown/keyUp per character, Input.insertText for non-ASCII), so keydown-based validation, autocomplete, and keyboard shortcuts on the page all fire. Focuses the field with a real mouse click first (DOM focus for checkboxes/radios to avoid toggling them). Native <select> elements are handled via DOM option selection. Falls back to a synthetic native-setter path when the debugger is unavailable or Chrome blocks initial input because another extension inserted a frame. This fallback is labeled inputMode synthetic and may fail trusted-event checks; partial input is never replayed. Works inside iframes: refs route to their frame automatically; pass frameId together with a selector.",
+  "Type text into an input, textarea, or contentEditable element. Dispatches TRUSTED keystrokes via the Chrome DevTools Protocol (real keyDown/keyUp per character, Input.insertText for non-ASCII), so keydown-based validation, autocomplete, and keyboard shortcuts on the page all fire. Focuses the field with a real mouse click first (DOM focus for checkboxes/radios to avoid toggling them). Native <select> elements are handled via DOM option selection. Falls back to a synthetic native-setter path when the debugger is unavailable or Chrome blocks initial input because another extension inserted a frame. On macOS, an explicitly enabled native helper can send OS keyboard events and reports inputMode native; otherwise the DOM fallback is labeled inputMode synthetic and may fail trusted-event checks. Partial input is never replayed. Works inside iframes: refs route to their frame automatically; pass frameId together with a selector.",
   {
     tabId: z
       .number()

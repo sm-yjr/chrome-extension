@@ -202,6 +202,11 @@ test('password-manager compatibility never replays partial input or hides fallba
     runInNewContext(helpers+'\nconst handlers={'+typeMethod+clickMethod+shotMethod+`async typeTextSynthetic(){countFallback();return {value:'synthetic-value'};}, async clickElementSynthetic(){countFallback();return {};}, async takeScreenshotLegacy(){return {image:'test'};}};globalThis.h=handlers;`,ctx);
     return {h:ctx.h,count:()=>fallbackCount};
   }
+  await t.test('native opt-in requests OS input instead of synthesizing DOM events',async()=>{
+    const h=harness({cdpSendTo:async()=>{throw forbidden;}});
+    const r=await h.h.typeText({tabId:1,text:'ab',clearFirst:true,nativeFallback:true});
+    assert.equal(r.nativeInputRequired,true);assert.equal(h.count(),0);
+  });
   await t.test('denied focus uses labeled DOM input',async()=>{
     const h=harness({cdpSendTo:async()=>{throw forbidden;}});
     const r=await h.h.typeText({tabId:1,text:'ab',clearFirst:true});assert.equal(r.inputMode,'synthetic');assert.equal(h.count(),1);
@@ -224,4 +229,16 @@ test('password-manager compatibility never replays partial input or hides fallba
     const h=harness({ensureCdp:async()=>{throw forbidden;}});
     assert.equal((await h.h.takeScreenshot({tabId:1})).source,'captureVisibleTab');
   });
+});
+
+
+test('macOS helper rejects a mismatched page before posting events', {skip:process.platform !== 'darwin'}, async t=>{
+  const {spawnSync}=await import('node:child_process');
+  const {fileURLToPath}=await import('node:url');
+  const binary=fileURLToPath(new URL('../native/.build/browser-native-input',import.meta.url));
+  try {await stat(binary);} catch {t.skip('Build the native helper first');return;}
+  const result=spawnSync(binary,[],{input:JSON.stringify({action:'text',expectedURL:'https://invalid.invalid/never-allowed',expectedDOMId:'not-the-focused-field',text:'must-not-be-sent'})+'\n',encoding:'utf8'});
+  assert.notEqual(result.status,0);
+  const reply=JSON.parse(result.stdout);assert.equal(reply.ok,false);assert.equal(reply.charactersSent,0);
+  assert.match(reply.error,/NATIVE_INPUT_(TARGET_CHANGED|FOCUS_CHANGED|PERMISSION_REQUIRED)/);
 });

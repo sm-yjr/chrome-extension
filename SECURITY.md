@@ -31,3 +31,9 @@ The public repository begins with a clean source snapshot, without the original 
 ## Reporting
 
 For a suspected vulnerability, avoid posting credentials, browsing data or a working exploit containing private data in public issues. Use GitHub private vulnerability reporting when available. Otherwise open a minimal issue requesting a private reporting channel without sensitive details.
+
+## Optional macOS native keyboard backend
+
+`BRIDGE_NATIVE_INPUT=1` opts the local MCP server into a locally compiled helper with Accessibility/event-posting authorization. Only the fixed project helper is spawned; no extension-supplied executable or shell command is executed, and text is sent through stdin rather than process arguments. No new listening endpoint is opened. The helper addresses Google Chrome's process with `CGEventPostToPid`, never the global input tap. It refuses non-HTTP(S) document targets, other foreground applications, non-editable focused elements and browser-chrome controls, and stops if the focused AX element changes during a batch. The extension additionally checks the original tab/window, exact document, target element and an expiring opaque ticket between batches. Tokens and password-manager data are not provided to this helper. Password readback remains redacted.
+
+This backend deliberately requires a foreground browser and carries the normal focus-race limitations of OS input automation. Do not manually operate the target Chrome window during input. Page scripts can react to trusted input, and a trusted paired MCP client remains a powerful actor. Failure after partial input is reported without automatically repeating characters. iCloud Passwords and its in-page list do not need to be disabled or edited. Native input is labeled `native`; it is not presented as CDP or as human physical keystrokes.
