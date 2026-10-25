@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { WebSocket } from 'ws';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { nonce, proof, equalProof } from '../../extension/auth.js';
+import { nonce, proof, equalProof, frameProof } from '../../extension/auth.js';
 
 const origin = `chrome-extension://${'a'.repeat(32)}`;
 const secret = randomBytes(32).toString('hex');
@@ -34,6 +34,17 @@ async function auth(url, key = secret) {
   if (!next) { await closed; return; }
   const [ack] = await next;
   assert.equal(JSON.parse(ack).proof, await proof(secret,'server',challenge.nonce,cn));
+  let sendSeq=0, recvSeq=0;
+  ws.sendSigned=async message=>{
+    const payload=JSON.stringify(message),seq=++sendSeq;
+    ws.send(JSON.stringify({seq,payload,proof:await frameProof(key,'client',challenge.nonce,cn,seq,payload)}));
+  };
+  ws.decode=async raw=>{
+    const msg=JSON.parse(raw);
+    assert.equal(msg.seq,++recvSeq);
+    assert.equal(msg.proof,await frameProof(key,'server',challenge.nonce,cn,msg.seq,msg.payload));
+    return JSON.parse(msg.payload);
+  };
   return ws;
 }
 
@@ -71,9 +82,9 @@ test('real server rejects untrusted peers and confines artifact writes', { timeo
     });
     let ws=await auth(url);
     const forbidden=join(dir,'forbidden.txt');
-    ws.on('message',raw=>{
-      const msg=JSON.parse(raw);
-      if(msg.id) ws.send(JSON.stringify({id:msg.id,result:{artifact:{data:'private artifact',encoding:'utf8',filePath:forbidden,filename:'result.txt'}}}));
+    ws.on('message',async raw=>{
+      const msg=await ws.decode(raw);
+      if(msg.id) await ws.sendSigned({id:msg.id,result:{artifact:{data:'private artifact',encoding:'utf8',filePath:forbidden,filename:'result.txt'}}});
     });
     await t.test('rogue disconnect cannot kill authenticated pending commands',async()=>{
       await auth(url,randomBytes(32).toString('hex'));
@@ -124,7 +135,7 @@ test('extension rejects forged servers before dispatching any command', async ()
     send(raw){this.sent.push(JSON.parse(raw));}
     close(){this.closed=true;this.readyState=3;this.onclose?.();}
   }
-  const ctx={nonce,validNonce:v=>typeof v==='string'&&/^[a-f0-9]{64}$/.test(v),proof,equalProof,PORT_START:17890,PORT_END:17909,
+  const ctx={nonce,frameProof,validNonce:v=>typeof v==='string'&&/^[a-f0-9]{64}$/.test(v),proof,equalProof,PORT_START:17890,PORT_END:17909,
     connections,WebSocket:FakeWebSocket,AbortSignal,fetch:async()=>({}),setTimeout,clearTimeout,
     chrome:{storage:{local:{get:async()=>({bridgeToken:secret})},session:{get:(_key,cb)=>cb({}),set:()=>{}}}},
     broadcastState:()=>{},handlers:{sensitive:async()=>{dispatched++;return {}; }},
@@ -143,6 +154,34 @@ test('extension rejects forged servers before dispatching any command', async ()
   await socket.onmessage({data:JSON.stringify({method:'authChallenge',nonce:sn2})});
   const response=socket.sent.find(msg=>msg.method==='authResponse');
   await socket.onmessage({data:JSON.stringify({method:'authOk',proof:await proof(secret,'server',sn2,response.nonce)})});
-  await socket.onmessage({data:JSON.stringify({method:'sensitive',id:2})});
-  assert.equal(dispatched,1);socket.close();
+  const payload=JSON.stringify({method:'sensitive',id:2});
+  const signed={seq:1,payload,proof:await frameProof(secret,'server',sn2,response.nonce,1,payload)};
+  await socket.onmessage({data:JSON.stringify(signed)});
+  assert.equal(dispatched,1);
+  await socket.onmessage({data:JSON.stringify(signed)});
+  assert.equal(dispatched,1);assert.ok(socket.closed);
+  // Even after successful mutual auth, a relay cannot inject a command frame.
+  await ctx.connect(17890);
+  const sn3=nonce();await socket.onmessage({data:JSON.stringify({method:'authChallenge',nonce:sn3})});
+  const response3=socket.sent.find(msg=>msg.method==='authResponse');
+  await socket.onmessage({data:JSON.stringify({method:'authOk',proof:await proof(secret,'server',sn3,response3.nonce)})});
+  await socket.onmessage({data:JSON.stringify({seq:1,payload,proof:nonce()})});
+  assert.equal(dispatched,1);assert.ok(socket.closed);
+});
+
+ test('server rejects tampered application frames after authentication', {timeout:10000}, async()=>{
+  let stderr='';
+  const transport=new StdioClientTransport({command:process.env.BUN || 'bun',args:['run','src/index.ts'],cwd:process.cwd(),env:{...process.env,BRIDGE_TOKEN:secret},stderr:'pipe'});
+  transport.stderr.on('data',chunk=>{stderr+=chunk;});
+  const client=new Client({name:'frame-test',version:'1.0.0'});
+  try {
+    await client.connect(transport);
+    const port=/Server listening on port (\d+)/.exec(stderr)[1];
+    const ws=await auth(`ws://127.0.0.1:${port}`);
+    const closed=once(ws,'close');
+    ws.send(JSON.stringify({seq:1,payload:JSON.stringify({id:1,result:'forged'}),proof:nonce()}));
+    await closed;
+    const result=await client.callTool({name:'list_browser_tabs',arguments:{}});
+    assert.equal(result.isError,true);
+  } finally {await client.close();}
 });

@@ -1,4 +1,4 @@
-import { nonce, validNonce, proof, equalProof } from "./auth.js";
+import { nonce, validNonce, proof, equalProof, frameProof } from "./auth.js";
 const PORT_START = 17890;
 const PORT_END = 17909;
 
@@ -16,9 +16,15 @@ async function getActiveTabId() {
 }
 
 function sendTo(ws, data) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(data));
-  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const conn = [...connections.values()].find(c => c.ws === ws);
+  if (!conn?.authed) { ws.send(JSON.stringify(data)); return; }
+  conn.outgoing = conn.outgoing.then(async () => {
+    const payload = JSON.stringify(data);
+    const seq = ++conn.sendSeq;
+    const mac = await frameProof(conn.token, "client", conn.serverNonce, conn.clientNonce, seq, payload);
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({seq, payload, proof: mac}));
+  }).catch(() => ws.close());
 }
 
 function getConnectedCount() {
@@ -7046,7 +7052,7 @@ async function connectToPort(port) {
   const current = connections.get(port);
   if (current && current.ws.readyState <= WebSocket.OPEN) return;
   const ws = new WebSocket(`ws://127.0.0.1:${port}`);
-  const conn = { ws, authed: false };
+  const conn = { ws, authed: false, outgoing: Promise.resolve(), incoming: Promise.resolve(), sendSeq: 0, recvSeq: 0, token: bridgeToken };
   connections.set(port, conn);
 
   const clientNonce = nonce();
@@ -7055,7 +7061,11 @@ async function connectToPort(port) {
   const authTimer = setTimeout(() => ws.close(), 5000);
   ws.onopen = () => {};
 
-  ws.onmessage = async (event) => {
+  ws.onmessage = (event) => {
+    conn.incoming = conn.incoming.then(() => handleMessage(event)).catch(() => ws.close());
+    return conn.incoming;
+  };
+  const handleMessage = async (event) => {
     let msg;
     try {
       msg = JSON.parse(event.data);
@@ -7078,6 +7088,8 @@ async function connectToPort(port) {
           phase = "verifying";
           const expected = await proof(bridgeToken, "server", serverNonce, clientNonce);
           if (!equalProof(msg.proof, expected)) return ws.close();
+          conn.serverNonce = serverNonce;
+          conn.clientNonce = clientNonce;
           conn.authed = true;
           clearTimeout(authTimer);
           broadcastState();
@@ -7088,6 +7100,15 @@ async function connectToPort(port) {
       ws.close();
       return;
     }
+
+    // Every application frame is signed, including sequence and session nonces.
+    // A relaying local service cannot inject or alter commands after pairing.
+    if (!Number.isSafeInteger(msg.seq) || msg.seq !== conn.recvSeq + 1 || typeof msg.payload !== "string") return ws.close();
+    const expectedFrame = await frameProof(bridgeToken, "server", serverNonce, clientNonce, msg.seq, msg.payload);
+    if (!equalProof(msg.proof, expectedFrame)) return ws.close();
+    conn.recvSeq = msg.seq;
+    try { msg = JSON.parse(msg.payload); } catch { return ws.close(); }
+    if (!msg || typeof msg !== "object") return ws.close();
 
     if (msg.method === "ping") {
       sendTo(ws, { method: "pong" });

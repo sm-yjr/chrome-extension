@@ -17,6 +17,7 @@ const PORT_END = 17909;
 const REQUEST_TIMEOUT = 30000;
 // Assigned when the extension connects; sendToExtension() talks to it.
 let extensionSocket: WebSocket | null = null;
+const secureSend = new WeakMap<WebSocket, (message: unknown) => void>();
 let requestId = 0;
 const pendingRequests = new Map<
   number,
@@ -81,9 +82,13 @@ const wss = await startServer();
 
 wss.on("connection", (socket) => {
   let authenticated = false;
+  let clientNonce = "";
+  let sendSeq = 0;
+  let recvSeq = 0;
   const serverNonce = randomBytes(32).toString("hex");
   const authTimer = setTimeout(() => socket.close(1008, "Authentication timeout"), 5000);
   socket.send(JSON.stringify({ method: "authChallenge", nonce: serverNonce }));
+  const frameMac = (role: string, seq: number, payload: string) => createHmac("sha256", BRIDGE_TOKEN!).update(`ccb-v1:message:${role}:${serverNonce}:${clientNonce}:${seq}:${payload}`).digest();
   socket.on("message", (data) => {
     let msg: any;
     try {
@@ -99,13 +104,25 @@ wss.on("connection", (socket) => {
       const mac = (role: string) => createHmac("sha256", BRIDGE_TOKEN!).update(`ccb-v1:${role}:${serverNonce}:${msg.nonce}`).digest();
       if (!timingSafeEqual(Buffer.from(msg.proof, "hex"), mac("client"))) return socket.close(1008, "Authentication failed");
       if (extensionSocket && extensionSocket.readyState === WebSocket.OPEN) return socket.close(1008, "Extension already connected");
+      clientNonce = msg.nonce;
       authenticated = true;
+      secureSend.set(socket, (message: unknown) => {
+        const payload = JSON.stringify(message);
+        const seq = ++sendSeq;
+        socket.send(JSON.stringify({seq, payload, proof: frameMac("server", seq, payload).toString("hex")}));
+      });
       clearTimeout(authTimer);
       extensionSocket = socket;
       socket.send(JSON.stringify({ method: "authOk", proof: mac("server").toString("hex") }));
       console.error("[bridge] Paired extension connected");
       return;
     }
+    if (!Number.isSafeInteger(msg.seq) || msg.seq !== recvSeq + 1 || typeof msg.payload !== "string" ||
+        typeof msg.proof !== "string" || !/^[a-f0-9]{64}$/.test(msg.proof) ||
+        !timingSafeEqual(Buffer.from(msg.proof, "hex"), frameMac("client", msg.seq, msg.payload))) return socket.close(1008, "Invalid signed frame");
+    recvSeq = msg.seq;
+    try { msg = JSON.parse(msg.payload); } catch { return socket.close(1008, "Invalid payload"); }
+    if (!msg || typeof msg !== "object") return socket.close(1008, "Invalid payload");
     if (msg.method === "extensionInfo") {
       console.error(`[bridge] Extension version: ${msg.params?.version}`);
       return;
@@ -168,7 +185,7 @@ function sendToExtension(method: string, params?: any, timeoutMs = REQUEST_TIMEO
       },
     });
 
-    extensionSocket.send(JSON.stringify({ id, method, params }));
+    secureSend.get(extensionSocket)!({ id, method, params });
   });
 }
 
@@ -176,7 +193,7 @@ function sendToExtension(method: string, params?: any, timeoutMs = REQUEST_TIMEO
 
 setInterval(() => {
   if (extensionSocket && extensionSocket.readyState === WebSocket.OPEN) {
-    extensionSocket.send(JSON.stringify({ method: "ping" }));
+    secureSend.get(extensionSocket)!({ method: "ping" });
   }
 }, 30000);
 
