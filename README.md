@@ -65,3 +65,7 @@ npm test
 ```
 
 Tests create a random token and disposable browser profile. They do not use your daily Chrome profile. See [verify/README.md](verify/README.md). Some CDP capabilities vary across Chromium builds; the tests accept explicit unsupported-API errors for site permission overrides.
+
+### Password-manager extension compatibility
+
+Some Chrome builds block debugger input or screenshots when another extension inserts its own frame (observed with iCloud Passwords). Before any text has been entered, the bridge can fall back to ordinary page DOM input and labels the result `inputMode: synthetic`. It does not access the other extension or change its settings. Sites requiring trusted input events may still reject this fallback. Partially typed input is never automatically replayed. Screenshot fallback captures the visible viewport through Chrome's normal capture API; full-page capture is unavailable in this case.

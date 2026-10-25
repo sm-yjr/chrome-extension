@@ -276,6 +276,7 @@ function toolHandler(method: string) {
               data: result.image,
               mimeType,
             },
+            { type: "text" as const, text: JSON.stringify({ source: result.source, note: result.note, width: result.width, height: result.height }) },
           ],
         };
       }
@@ -628,7 +629,7 @@ server.tool(
 
 server.tool(
   "type_text",
-  "Type text into an input, textarea, or contentEditable element. Dispatches TRUSTED keystrokes via the Chrome DevTools Protocol (real keyDown/keyUp per character, Input.insertText for non-ASCII), so keydown-based validation, autocomplete, and keyboard shortcuts on the page all fire. Focuses the field with a real mouse click first (DOM focus for checkboxes/radios to avoid toggling them). Native <select> elements are handled via DOM option selection. Falls back to a synthetic native-setter path when the debugger is unavailable. Works inside iframes: refs route to their frame automatically; pass frameId together with a selector.",
+  "Type text into an input, textarea, or contentEditable element. Dispatches TRUSTED keystrokes via the Chrome DevTools Protocol (real keyDown/keyUp per character, Input.insertText for non-ASCII), so keydown-based validation, autocomplete, and keyboard shortcuts on the page all fire. Focuses the field with a real mouse click first (DOM focus for checkboxes/radios to avoid toggling them). Native <select> elements are handled via DOM option selection. Falls back to a synthetic native-setter path when the debugger is unavailable or Chrome blocks initial input because another extension inserted a frame. This fallback is labeled inputMode synthetic and may fail trusted-event checks; partial input is never replayed. Works inside iframes: refs route to their frame automatically; pass frameId together with a selector.",
   {
     tabId: z
       .number()

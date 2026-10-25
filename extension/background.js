@@ -120,6 +120,16 @@ function isCdpMethodMissing(err) {
   return /wasn't found|unknown method|method not found|\b-32601\b/i.test(msg);
 }
 
+// Chrome can block a tab's debugger after a password-manager extension adds
+// its own frame. Only ordinary page APIs remain available; never access that frame.
+function isForeignExtensionDenied(err) {
+  return String(err?.message || err).includes("Cannot access a chrome-extension:// URL of different extension");
+}
+async function syntheticInputFallback(method, params) {
+  const result = await handlers[method](params);
+  return { ...result, inputMode: "synthetic", fallbackReason: "Chrome blocked CDP input due to another extension frame; used permitted page DOM APIs. Trusted-event checks may reject this input." };
+}
+
 function codedError(code, message) {
   const err = new Error(message);
   err.code = code;
@@ -3014,9 +3024,14 @@ const handlers = {
     const tgt = inputTargetFor(geo);
 
     // Trusted mouse sequence via CDP: move, then press/release per click.
-    await cdpSendTo(tabId, tgt.sessionId, "Input.dispatchMouseEvent", {
-      type: "mouseMoved", x: tgt.x, y: tgt.y, buttons: 0,
-    });
+    try {
+      await cdpSendTo(tabId, tgt.sessionId, "Input.dispatchMouseEvent", {
+        type: "mouseMoved", x: tgt.x, y: tgt.y, buttons: 0,
+      });
+    } catch (e) {
+      if (isForeignExtensionDenied(e)) return syntheticInputFallback("clickElementSynthetic", params);
+      throw e;
+    }
     for (let i = 1; i <= count; i++) {
       await cdpSendTo(tabId, tgt.sessionId, "Input.dispatchMouseEvent", {
         type: "mousePressed", x: tgt.x, y: tgt.y, button, buttons, clickCount: i,
@@ -3155,55 +3170,72 @@ const handlers = {
       return handlers.typeTextSynthetic(params);
     }
 
-    // Focus like a user would: a real click for text-ish fields (places the
-    // caret), DOM focus() otherwise so we don't toggle checkboxes/radios.
-    const clickToFocus =
-      !geo.disabled &&
-      (geo.tagName === "textarea" ||
-        geo.isEditable ||
-        (geo.tagName === "input" &&
-          !["checkbox", "radio", "button", "submit", "reset", "file", "range", "color"].includes(
-            geo.inputType || "text"
-          )));
-    if (clickToFocus) {
-      // OOPIF fields: the focusing click goes to the frame's own session in
-      // frame-local coordinates. Keyboard events that follow are frame-
-      // agnostic (the browser routes them to the focused widget).
-      const tgt = inputTargetFor(geo);
-      await cdpSendTo(tabId, tgt.sessionId, "Input.dispatchMouseEvent", {
-        type: "mousePressed", x: tgt.x, y: tgt.y, button: "left", buttons: 1, clickCount: 1,
-      });
-      await cdpSendTo(tabId, tgt.sessionId, "Input.dispatchMouseEvent", {
-        type: "mouseReleased", x: tgt.x, y: tgt.y, button: "left", buttons: 0, clickCount: 1,
-      });
-    } else {
-      await focusElement(tabId, params);
-    }
+    // No text has been inserted yet. A denied focus/clear operation may use
+    // the ordinary DOM path without replaying a partially typed value.
+    try {
+      // Focus like a user would: a real click for text-ish fields (places the
+      // caret), DOM focus() otherwise so we don't toggle checkboxes/radios.
+      const clickToFocus =
+        !geo.disabled &&
+        (geo.tagName === "textarea" ||
+          geo.isEditable ||
+          (geo.tagName === "input" &&
+            !["checkbox", "radio", "button", "submit", "reset", "file", "range", "color"].includes(
+              geo.inputType || "text"
+            )));
+      if (clickToFocus) {
+        // OOPIF fields: the focusing click goes to the frame's own session in
+        // frame-local coordinates. Keyboard events that follow are frame-
+        // agnostic (the browser routes them to the focused widget).
+        const tgt = inputTargetFor(geo);
+        await cdpSendTo(tabId, tgt.sessionId, "Input.dispatchMouseEvent", {
+          type: "mousePressed", x: tgt.x, y: tgt.y, button: "left", buttons: 1, clickCount: 1,
+        });
+        await cdpSendTo(tabId, tgt.sessionId, "Input.dispatchMouseEvent", {
+          type: "mouseReleased", x: tgt.x, y: tgt.y, button: "left", buttons: 0, clickCount: 1,
+        });
+      } else {
+        await focusElement(tabId, params);
+      }
 
-    if (clearFirst) {
-      await selectAllInElement(tabId, params);
-      await cdpPressKeyCombo(tabId, "Backspace");
-    }
+      if (clearFirst) {
+        await selectAllInElement(tabId, params);
+        await cdpPressKeyCombo(tabId, "Backspace");
+      }
 
+    } catch (e) {
+      if (isForeignExtensionDenied(e)) return syntheticInputFallback("typeTextSynthetic", params);
+      throw e;
+    }
+    let insertedCharacters = 0;
     for (const ch of String(text)) {
       if (ch === "\n" || ch === "\r") {
         await cdpPressKeyCombo(tabId, "Enter");
+        insertedCharacters++;
         continue;
       }
       if (ch === "\t") {
         await cdpPressKeyCombo(tabId, "Tab");
+        insertedCharacters++;
         continue;
       }
       if (ch.codePointAt(0) > 126) {
         // Non-ASCII (CJK, emoji, ...): insertText is the reliable route.
         await cdpSend(tabId, "Input.insertText", { text: ch });
+        insertedCharacters++;
         continue;
       }
       const def = keyDefFor(ch);
-      await cdpSend(tabId, "Input.dispatchKeyEvent", {
-        type: "keyDown", text: ch, unmodifiedText: ch, key: ch,
-        code: def.code, windowsVirtualKeyCode: def.vk, nativeVirtualKeyCode: def.vk,
-      });
+      try {
+        await cdpSend(tabId, "Input.dispatchKeyEvent", {
+          type: "keyDown", text: ch, unmodifiedText: ch, key: ch,
+          code: def.code, windowsVirtualKeyCode: def.vk, nativeVirtualKeyCode: def.vk,
+        });
+      } catch (e) {
+        if (insertedCharacters === 0 && isForeignExtensionDenied(e)) return syntheticInputFallback("typeTextSynthetic", params);
+        throw e;
+      }
+      insertedCharacters++;
       await cdpSend(tabId, "Input.dispatchKeyEvent", {
         type: "keyUp", key: ch, code: def.code,
         windowsVirtualKeyCode: def.vk, nativeVirtualKeyCode: def.vk,
@@ -4341,11 +4373,12 @@ const handlers = {
       const r = await cdpSendTo(tabId, shotSessionId, "Page.captureScreenshot", shot);
       return { image: r.data, format, source: "cdp", ...(dims || {}), ...(oopif || {}) };
     } catch (e) {
-      if (isCdpUnavailable(e)) {
+      if (isCdpUnavailable(e) || isForeignExtensionDenied(e)) {
         const legacy = await handlers.takeScreenshotLegacy(params);
         return {
           ...legacy,
-          note: "Debugger unavailable; captured the visible viewport via captureVisibleTab (fullPage ignored).",
+          source: "captureVisibleTab",
+          note: "Debugger unavailable or blocked by another extension; captured the visible viewport via permitted Chrome API (fullPage ignored).",
         };
       }
       throw e;
@@ -4420,7 +4453,6 @@ const handlers = {
         // Crop the image using OffscreenCanvas in the page context
         const cropResults = await chrome.scripting.executeScript({
           target: { tabId },
-          world: "MAIN",
           func: async (imgBase64, imgFormat, rect) => {
             const img = new Image();
             await new Promise((resolve, reject) => {

@@ -185,3 +185,43 @@ test('extension rejects forged servers before dispatching any command', async ()
     assert.equal(result.isError,true);
   } finally {await client.close();}
 });
+
+test('password-manager compatibility never replays partial input or hides fallback mode', async t => {
+  const {runInNewContext}=await import('node:vm');
+  const src=await readFile(new URL('../../extension/background.js',import.meta.url),'utf8');
+  const helpers=src.slice(src.indexOf('function isForeignExtensionDenied('),src.indexOf('function codedError('));
+  const typeMethod=src.slice(src.indexOf('  async typeText(params)'),src.indexOf('  // Fallback: native property descriptor setter'));
+  const clickMethod=src.slice(src.indexOf('  async clickElement(params)'),src.indexOf('  // Fallback: synthetic DOM events (debugger unavailable'));
+  const shotMethod=src.slice(src.indexOf('  async takeScreenshot(params)'),src.indexOf('  // Fallback: captureVisibleTab + OffscreenCanvas'));
+  const forbidden=new Error('CDP command failed: Cannot access a chrome-extension:// URL of different extension');
+  // Keep state in one context so each assertion can inspect whether DOM fallback ran.
+  function harness(overrides={}){
+    let fallbackCount=0;
+    const ctx={countFallback:()=>fallbackCount++,ensureCdp:async()=>{},isCdpUnavailable:()=>false,getElementGeometry:async()=>({tagName:'input',inputType:'text',frameId:0}),inputTargetFor:()=>({x:1,y:1}),
+      cdpSendTo:async()=>{},cdpSend:async()=>{},selectAllInElement:async()=>{},cdpPressKeyCombo:async()=>{},keyDefFor:()=>({code:'KeyA',vk:65}),MOUSE_BUTTONS:{left:{button:'left',buttons:1}},...overrides};
+    runInNewContext(helpers+'\nconst handlers={'+typeMethod+clickMethod+shotMethod+`async typeTextSynthetic(){countFallback();return {value:'synthetic-value'};}, async clickElementSynthetic(){countFallback();return {};}, async takeScreenshotLegacy(){return {image:'test'};}};globalThis.h=handlers;`,ctx);
+    return {h:ctx.h,count:()=>fallbackCount};
+  }
+  await t.test('denied focus uses labeled DOM input',async()=>{
+    const h=harness({cdpSendTo:async()=>{throw forbidden;}});
+    const r=await h.h.typeText({tabId:1,text:'ab',clearFirst:true});assert.equal(r.inputMode,'synthetic');assert.equal(h.count(),1);
+  });
+  await t.test('denied first key uses DOM, but partial input is never replayed',async()=>{
+    let h=harness({cdpSend:async()=>{throw forbidden;}});
+    assert.equal((await h.h.typeText({tabId:1,text:'ab'})).inputMode,'synthetic');
+    let calls=0;h=harness({cdpSend:async()=>{if(++calls===3)throw forbidden;}});
+    await assert.rejects(h.h.typeText({tabId:1,text:'ab'}),/different extension/);assert.equal(h.count(),0);
+  });
+  await t.test('unrelated failures remain errors',async()=>{
+    const h=harness({cdpSendTo:async()=>{throw new Error('renderer crashed');}});
+    await assert.rejects(h.h.typeText({tabId:1,text:'ab'}),/renderer crashed/);assert.equal(h.count(),0);
+  });
+  await t.test('denied initial mouse move can fall back without a duplicate click',async()=>{
+    const h=harness({cdpSendTo:async()=>{throw forbidden;}});
+    assert.equal((await h.h.clickElement({tabId:1,selector:'#button'})).inputMode,'synthetic');assert.equal(h.count(),1);
+  });
+  await t.test('screenshot fallback identifies viewport capture',async()=>{
+    const h=harness({ensureCdp:async()=>{throw forbidden;}});
+    assert.equal((await h.h.takeScreenshot({tabId:1})).source,'captureVisibleTab');
+  });
+});
